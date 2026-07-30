@@ -87,8 +87,9 @@ const SYSTEM_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Age
 const BILLING_PREFIX = 'x-anthropic-billing-header:';
 
 const START = Date.now();
-// Stable per-process session id: header and metadata.user_id stay in lockstep.
-const sessionId = crypto.randomUUID();
+// Fallback session id for requests that carry no upstream session identifier;
+// requests that have one get their own id (see sessionIdFor).
+const processSessionId = crypto.randomUUID();
 process.title = 'kimi-claude-auth-proxy';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -586,8 +587,57 @@ function shouldRelocateSystem() {
   return true;
 }
 
+// One proxy process serves every Kimi session on this machine. Anthropic sees
+// the session id twice (x-claude-code-session-id and metadata.user_id), so
+// collapsing all of them onto one id makes a handful of independent sessions
+// look like a single Claude Code client fanning out requests. Keep one stable
+// uuid per upstream session instead. Nothing ever tells us a session ended, so
+// both maps below are bounded LRUs.
+const SESSION_LIMIT = 64;
+
+function lruTouch(map, key) {
+  const value = map.get(key);
+  if (value === undefined) return undefined;
+  map.delete(key); // re-insert so the least recently used key stays first
+  map.set(key, value);
+  return value;
+}
+
+function lruPut(map, key, value) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > SESSION_LIMIT) map.delete(map.keys().next().value);
+  return value;
+}
+
+// metadata.user_id is the only per-conversation identifier we get. Kimi sends
+// its bare session id there ("session_<uuid>"); other callers may send a JSON
+// blob with a session_id field, so both shapes are accepted. Must be read
+// before injectMetadataUserId overwrites the field.
+function readUpstreamSessionKey(parsed) {
+  const raw = isRecord(parsed) && isRecord(parsed.metadata) ? parsed.metadata.user_id : null;
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  try {
+    const existing = JSON.parse(raw);
+    if (isRecord(existing) && typeof existing.session_id === 'string' && existing.session_id.length > 0) {
+      return existing.session_id;
+    }
+  } catch {
+    // non-JSON user_id: the raw string identifies the caller well enough
+  }
+  return raw;
+}
+
+const upstreamSessionIds = new Map(); // upstream session key -> claude-code session uuid
+
+function sessionIdFor(key) {
+  if (!key) return processSessionId;
+  return lruTouch(upstreamSessionIds, key) || lruPut(upstreamSessionIds, key, crypto.randomUUID());
+}
+
 function injectMetadataUserId(parsed) {
   const metadata = isRecord(parsed.metadata) ? parsed.metadata : {};
+  const sessionId = sessionIdFor(readUpstreamSessionKey(parsed));
   let existing = {};
   if (typeof metadata.user_id === 'string' && metadata.user_id.length > 0) {
     try {
@@ -610,11 +660,51 @@ function isInvalidThinkingSignatureError(status, body) {
   return status === 400 && /invalid.{0,40}signature.{0,40}thinking/i.test(body);
 }
 
+// The sanitized body only goes upstream — Kimi keeps storing the bad blocks and
+// replays them next turn, so without a memo every turn of a mixed-model session
+// would burn one rejected round trip to rediscover the same thing. Keyed by
+// session AND model: the very blocks that are foreign to one model are the
+// legitimate signed history of the model that produced them.
+const presanitizeMarks = new Map();
+
+const presanitizeKey = (sessionKey, modelId) => (sessionKey ? `${sessionKey}\u0000${modelId}` : null);
+const markPresanitize = (key) => { if (key) lruPut(presanitizeMarks, key, true); };
+const needsPresanitize = (key) => !!key && lruTouch(presanitizeMarks, key) === true;
+
+const toContentBlocks = (content) =>
+  typeof content === 'string'
+    ? [{ type: 'text', text: content }]
+    : Array.isArray(content)
+      ? content
+      : [];
+
+// Dropping an assistant turn can leave two user turns back to back, which the
+// API rejects. Fold them into one, preserving block order (and with it the
+// 1h-before-5m cache breakpoint ordering).
+function mergeAdjacentUserMessages(messages) {
+  const out = [];
+  for (const message of messages) {
+    const prev = out[out.length - 1];
+    if (isRecord(prev) && prev.role === 'user' && isRecord(message) && message.role === 'user') {
+      out[out.length - 1] = {
+        ...prev,
+        content: [...toContentBlocks(prev.content), ...toContentBlocks(message.content)],
+      };
+      continue;
+    }
+    out.push(message);
+  }
+  return out;
+}
+
 // Thinking signatures are bound to the model/provider that produced them.
 // When Kimi switches models inside an existing session it can replay a foreign
-// signed thinking block, which Anthropic rejects. On that specific error, turn
-// visible thinking into ordinary assistant text and drop redacted blocks, then
-// retry once. Normal same-model requests keep their signed blocks untouched.
+// signed thinking block, which Anthropic rejects. Drop those blocks outright:
+// the reasoning is scratch work whose conclusions already live in the adjacent
+// text blocks. Keeping it as prefixed text instead would pay for it in tokens
+// on every later turn AND show the model several of its own replies opening
+// with that marker, which it then imitates. Normal same-model requests keep
+// their signed blocks untouched.
 function sanitizeHistoricalThinkingBody(body) {
   let parsed;
   try {
@@ -625,33 +715,27 @@ function sanitizeHistoricalThinkingBody(body) {
   if (!isRecord(parsed) || !Array.isArray(parsed.messages)) return null;
 
   let changed = false;
+  const kept = [];
   for (const message of parsed.messages) {
-    if (!isRecord(message) || message.role !== 'assistant' || !Array.isArray(message.content)) continue;
-    const content = [];
-    for (const block of message.content) {
-      if (!isRecord(block)) {
-        content.push(block);
-        continue;
-      }
-      if (block.type === 'thinking') {
-        changed = true;
-        if (typeof block.thinking === 'string' && block.thinking.trim().length > 0) {
-          content.push({ type: 'text', text: `[Reasoning from a previous model]\n${block.thinking}` });
-        }
-        continue;
-      }
-      if (block.type === 'redacted_thinking') {
-        changed = true;
-        continue;
-      }
-      content.push(block);
+    if (!isRecord(message) || message.role !== 'assistant' || !Array.isArray(message.content)) {
+      kept.push(message);
+      continue;
     }
-    if (content.length === 0) {
-      content.push({ type: 'text', text: '[Previous assistant reasoning omitted after model switch]' });
-    }
-    message.content = content;
+    const content = message.content.filter((block) => {
+      if (!isRecord(block) || (block.type !== 'thinking' && block.type !== 'redacted_thinking')) return true;
+      changed = true;
+      return false;
+    });
+    // An assistant turn that was nothing but thinking has nothing left to say.
+    // Dropping it cannot orphan a tool_result: tool_use blocks always survive.
+    if (content.length === 0) continue;
+    kept.push({ ...message, content });
   }
   if (!changed) return null;
+
+  const messages = mergeAdjacentUserMessages(kept);
+  if (messages.length === 0) return null; // nothing left to send; let the error through
+  parsed.messages = messages;
 
   // The request body changed, so reset and recompute its billing attestation.
   if (Array.isArray(parsed.system)) {
@@ -1176,7 +1260,7 @@ async function getCredentials() {
 // except anthropic-beta (merged) and the path.
 // ---------------------------------------------------------------------------
 
-function buildHeaders(accessToken, modelId, incomingBeta, excluded, contentLength) {
+function buildHeaders(accessToken, modelId, incomingBeta, excluded, contentLength, sessionId) {
   const betas = getModelBetas(modelId, excluded);
   for (const beta of String(incomingBeta || '').split(',').map((s) => s.trim()).filter(Boolean)) {
     if (!betas.includes(beta)) betas.push(beta);
@@ -1279,9 +1363,14 @@ function sendError(res, status, type, message) {
 
 async function handleApiRequest(req, res, rawBody) {
   let modelId = 'unknown';
+  let sessionKey = null;
   try {
-    modelId = JSON.parse(rawBody.toString('utf-8')).model || 'unknown';
+    const incoming = JSON.parse(rawBody.toString('utf-8'));
+    modelId = incoming.model || 'unknown';
+    sessionKey = readUpstreamSessionKey(incoming); // read before transformBody rewrites it
   } catch {}
+  const sessionId = sessionIdFor(sessionKey);
+  const sanitizeKey = presanitizeKey(sessionKey, modelId);
 
   const creds = await getCredentials();
   if (!creds) {
@@ -1306,14 +1395,27 @@ async function handleApiRequest(req, res, rawBody) {
     }
   }
 
+  let didThinkingSignatureRetry = false;
+  // This conversation already had a thinking signature rejected on this model,
+  // and Kimi replays the same history every turn — sanitize up front instead of
+  // spending another rejected round trip to be told the same thing.
+  if (needsPresanitize(sanitizeKey)) {
+    const presanitized = sanitizeHistoricalThinkingBody(outBody);
+    if (presanitized) {
+      outBody = presanitized;
+      didThinkingSignatureRetry = true;
+    }
+  }
+
   const upstreamPath = buildUpstreamPath(req.url);
   const incomingBeta = req.headers['anthropic-beta'] || '';
   let token = creds.accessToken;
-  let headers = buildHeaders(token, modelId, incomingBeta, getExcludedBetas(modelId), outBody.length);
+  const rebuildHeaders = () =>
+    buildHeaders(token, modelId, incomingBeta, getExcludedBetas(modelId), outBody.length, sessionId);
+  let headers = rebuildHeaders();
 
   let rateRetries = 0;
   let did401Retry = false;
-  let didThinkingSignatureRetry = false;
 
   for (;;) {
     let up;
@@ -1342,8 +1444,9 @@ async function handleApiRequest(req, res, rawBody) {
       const sanitized = sanitizeHistoricalThinkingBody(outBody);
       if (sanitized) {
         didThinkingSignatureRetry = true;
+        markPresanitize(sanitizeKey);
         outBody = sanitized;
-        headers = buildHeaders(token, modelId, incomingBeta, getExcludedBetas(modelId), outBody.length);
+        headers = rebuildHeaders();
         console.log(`kimi-claude-auth: removed foreign thinking signatures for ${modelId}, retrying once`);
         continue;
       }
@@ -1370,7 +1473,7 @@ async function handleApiRequest(req, res, rawBody) {
       const fresh = await getCredentials();
       if (fresh && fresh.accessToken !== token) {
         token = fresh.accessToken;
-        headers = buildHeaders(token, modelId, incomingBeta, getExcludedBetas(modelId), outBody.length);
+        headers = rebuildHeaders();
         continue;
       }
     }
@@ -1381,7 +1484,7 @@ async function handleApiRequest(req, res, rawBody) {
       if (beta) {
         addExcludedBeta(modelId, beta);
         console.log(`kimi-claude-auth: excluding beta ${beta} for ${modelId} after long-context error`);
-        headers = buildHeaders(token, modelId, incomingBeta, getExcludedBetas(modelId), outBody.length);
+        headers = rebuildHeaders();
         continue;
       }
     }
@@ -1449,6 +1552,18 @@ const server = http.createServer((req, res) => {
     });
   });
   req.on('error', () => res.destroy());
+});
+
+// Two sessions starting at once both probe the port, both find it dead and both
+// spawn a proxy; the loser must lose quietly instead of dumping a stack trace
+// into proxy.log. Any other listen error is a real failure.
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.log(`kimi-claude-auth: 127.0.0.1:${PORT} already has a proxy; this process exits`);
+    process.exit(0);
+  }
+  console.error(`kimi-claude-auth: server error: ${err && err.message ? err.message : err}`);
+  process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

@@ -42,7 +42,12 @@ Disclaimer: this reuses subscription OAuth tokens with a third-party client and 
 /plugins install /Users/ol125/Documents/kimi-claude-auth
 ```
 
-插件的 SessionStart hook 会自动检查代理健康状态，没在跑就守护化拉起（日志写到插件目录下 `proxy/proxy.log`）。
+插件用两个 hook 保证代理可用（都跑同一个 `hooks/proxy-ensure.cjs`，日志写到插件目录下 `proxy/proxy.log`）：
+
+- `SessionStart`：会话开始时探测 `/health`，没在跑就守护化拉起，并打印一行状态
+- `UserPromptSubmit`：每次发消息前复查，**正常情况下完全静默**（这条路径的 stdout 会被追加进上下文），只有代理起不来时才出声；10 秒内已确认过健康就跳过探测（时间戳记在 `proxy/.health-stamp`）
+
+两个 hook 都会把 `/health` 返回的 `version` 与 `kimi.plugin.json` 比对。代理是 detached 进程，不随会话退出，所以升级插件后旧进程会一直跑旧代码——版本对不上时按 `/health` 里的 `pid` kill 掉，等端口释放后用新代码重新拉起（代理设了 `process.title`，`pkill -f` 在 macOS 上匹配不到，只能用 pid）。
 
 ## 配置 Kimi Code
 
@@ -78,7 +83,7 @@ max_context_size = 200000
 3. 对不支持 effort 的模型（haiku）剥掉 `output_config.effort` / `thinking.effort`
 4. `max_tokens` 钳制到 64000
 5. 开启 thinking 且未显式设置时，注入默认 `context_management`（`clear_thinking_20251015`）
-6. `metadata.user_id` 稳定化为包含本进程 `session_id` 的 JSON
+6. `metadata.user_id` 稳定化为包含 `session_id` 的 JSON：每个上游 Kimi 会话映射到一个独立且稳定的 UUID（key 取请求里原始 `metadata.user_id` 的 `session_id`，最多记 64 个会话，取不到时回退到进程级 UUID）。一个代理进程会服务多个 Kimi 会话，全部塞同一个 session_id 在 Anthropic 看来就是一个 Claude Code 客户端在并发发请求
 7. 第三方 system prompt（如 Kimi Code 自己的身份）默认挪进第一条 user message（`KIMI_CLAUDE_AUTH_KEEP_SYSTEM=1` 可关闭）——这是 Claude Code 计费识别的关键行为
 8. 修复 tool_use/tool_result 配对（缺失的补占位 result、孤儿 result 转文本）；会话末尾是 assistant 消息时补一条 user 消息（带 prefill 限制的模型要求）
 9. prompt caching：已有的 5m ephemeral breakpoint 升级为 OAuth 默认 1h TTL，按 Claude Code 布局在 system 末尾与最近消息上放置 breakpoint，强制执行 Anthropic 4 个 breakpoint 上限，并保证 1h breakpoint 排在 5m 之前
@@ -93,7 +98,7 @@ max_context_size = 200000
 - `authorization: Bearer <OAuth token>`、`anthropic-version: 2023-06-01`
 - `anthropic-beta`：默认集合（`claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20`）+ 末尾 `extended-cache-ttl-2025-04-11`，并按模型增删（haiku 去掉 interleaved-thinking；4-6/4-7 加 effort beta；`-1m` 模型加 context-1m beta）
 - `user-agent: claude-cli/<ver> (external, local-agent, agent-sdk/<ver>)`、`x-app: cli`、`anthropic-client-platform/version`、`anthropic-dangerous-direct-browser-access`
-- 一组 `x-stainless-*` 头、`x-client-request-id`（每请求随机）、`X-Claude-Code-Session-Id`（每进程稳定）
+- 一组 `x-stainless-*` 头、`x-client-request-id`（每请求随机）、`X-Claude-Code-Session-Id`（与 body 里的 `session_id` 同源，按上游会话稳定）
 - `/v1/messages` 自动补 `?beta=true`
 
 响应方向不做任何变换，SSE 逐块流式透传，成功路径不缓冲。
@@ -103,6 +108,8 @@ max_context_size = 200000
 - 429/529：尊重 `retry-after` 最多重试 2 次，等待超过 `KIMI_CLAUDE_AUTH_MAX_RETRY_MS`（默认 30s）就直接把错误透传给客户端（那通常意味着小时级的配额重置，重等没意义）
 - 401：强制刷新凭证后重试一次
 - 长上下文计费错误（400/429 且错误文本匹配）：逐个剔除长上下文 beta flag 重试（进程内记忆）
+- 400 且报 thinking 签名无效：thinking 签名绑定在生成它的模型上，会话中途换模型时 Kimi 会把旧模型签名的 thinking 块重放上去。这时把历史里所有 `thinking` / `redacted_thinking` 块**直接丢弃**后重试一次——思考过程丢掉即可，结论本来就在 assistant 的 text 块里；转成带前缀的普通文本会永久占 token，而且模型看到自己前几轮回复都带这个前缀，会跟着模仿。清完为空的 assistant 消息整条删掉，必要时合并相邻的 user 消息（tool_use 块不会被删，配对不受影响）
+- 清洗后的 body 只发给上游，Kimi 本地存的历史仍然带着坏签名块，下一轮还会原样重放。所以同一「会话 + 模型」命中过一次后就记住（最多 64 条），后续请求直接预清洗，不再每轮先撞一次 400
 
 ## 环境变量
 
@@ -131,6 +138,8 @@ max_context_size = 200000
 | 长上下文报 extra usage | 订阅不含 1M context 计费 | 别用 `-1m` 后缀模型；代理也会自动剔除 context-1m beta 重试 |
 | 想确认代理整形后的样子 | — | `curl -s http://127.0.0.1:8320/health` 看凭证状态；请求日志每请求一行在 `proxy/proxy.log` |
 | Kimi Code 没走代理 | config.toml 里 provider 没配对 | 确认 `[providers.claude]` 的 `base_url` 与端口一致，且模型的 `provider = "claude"` |
+| `proxy.log` 里出现 `already has a proxy; this process exits` | 两个会话同时探测到端口没人应答，抢着拉代理 | 正常现象，后启动的那个会静默退出，不影响先起来的那个 |
+| 升级插件后行为没变化 | 旧代理进程还在跑旧代码 | hook 会自动按版本替换；也可 `curl -s http://127.0.0.1:8320/health` 看 `version` 是否等于 `kimi.plugin.json` 里的版本 |
 
 手动运行代理（调试用）：
 
