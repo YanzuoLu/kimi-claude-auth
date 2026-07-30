@@ -1,0 +1,6 @@
+The Anthropic OAuth request-shaping behavior in this project (billing-header
+attestation, beta flag sets, Claude Code identity headers, system-prompt
+relocation, prompt-cache layout, credential refresh flow) is reimplemented
+for interoperability, informed by the MIT-licensed opencode-claude-auth
+project (griffinmartin/opencode-claude-auth and the YanzuoLu fork). No source
+code was copied verbatim; the implementation here is original.
