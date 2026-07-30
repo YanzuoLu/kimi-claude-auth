@@ -1,6 +1,6 @@
 {
   "name": "kimi-claude-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use Claude models in Kimi Code CLI with your local Claude Code OAuth credentials",
   "hooks": [
     { "event": "SessionStart", "command": "node ./hooks/proxy-ensure.cjs", "timeout": 15 }

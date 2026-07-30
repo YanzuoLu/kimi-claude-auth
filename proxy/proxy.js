@@ -606,6 +606,66 @@ function isThinkingEnabled(thinking) {
   return thinking.budget_tokens != null || thinking.budget != null;
 }
 
+function isInvalidThinkingSignatureError(status, body) {
+  return status === 400 && /invalid.{0,40}signature.{0,40}thinking/i.test(body);
+}
+
+// Thinking signatures are bound to the model/provider that produced them.
+// When Kimi switches models inside an existing session it can replay a foreign
+// signed thinking block, which Anthropic rejects. On that specific error, turn
+// visible thinking into ordinary assistant text and drop redacted blocks, then
+// retry once. Normal same-model requests keep their signed blocks untouched.
+function sanitizeHistoricalThinkingBody(body) {
+  let parsed;
+  try {
+    parsed = JSON.parse(body.toString('utf-8'));
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.messages)) return null;
+
+  let changed = false;
+  for (const message of parsed.messages) {
+    if (!isRecord(message) || message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    const content = [];
+    for (const block of message.content) {
+      if (!isRecord(block)) {
+        content.push(block);
+        continue;
+      }
+      if (block.type === 'thinking') {
+        changed = true;
+        if (typeof block.thinking === 'string' && block.thinking.trim().length > 0) {
+          content.push({ type: 'text', text: `[Reasoning from a previous model]\n${block.thinking}` });
+        }
+        continue;
+      }
+      if (block.type === 'redacted_thinking') {
+        changed = true;
+        continue;
+      }
+      content.push(block);
+    }
+    if (content.length === 0) {
+      content.push({ type: 'text', text: '[Previous assistant reasoning omitted after model switch]' });
+    }
+    message.content = content;
+  }
+  if (!changed) return null;
+
+  // The request body changed, so reset and recompute its billing attestation.
+  if (Array.isArray(parsed.system)) {
+    for (const block of parsed.system) {
+      if (!isRecord(block) || typeof block.text !== 'string') continue;
+      if (!block.text.startsWith(BILLING_PREFIX)) continue;
+      block.text = block.text.replace(/cch=[0-9a-f]{5}/i, CCH_PLACEHOLDER);
+    }
+  }
+  const retryBody = Buffer.from(JSON.stringify(parsed), 'utf-8');
+  if (retryBody.includes(CCH_PLACEHOLDER)) patchCch(retryBody);
+  return retryBody;
+}
+
 // Ensure every assistant tool_use has a tool_result in the following user
 // turn, synthesizing omissions and converting stale results to text.
 function repairToolPairs(messages) {
@@ -1253,6 +1313,7 @@ async function handleApiRequest(req, res, rawBody) {
 
   let rateRetries = 0;
   let did401Retry = false;
+  let didThinkingSignatureRetry = false;
 
   for (;;) {
     let up;
@@ -1276,6 +1337,17 @@ async function handleApiRequest(req, res, rawBody) {
     // Retryable statuses: buffer the (small) error body to decide.
     const rawErr = await readAll(up);
     const errText = decompress(up.headers, rawErr).toString('utf-8');
+
+    if (!didThinkingSignatureRetry && isInvalidThinkingSignatureError(status, errText)) {
+      const sanitized = sanitizeHistoricalThinkingBody(outBody);
+      if (sanitized) {
+        didThinkingSignatureRetry = true;
+        outBody = sanitized;
+        headers = buildHeaders(token, modelId, incomingBeta, getExcludedBetas(modelId), outBody.length);
+        console.log(`kimi-claude-auth: removed foreign thinking signatures for ${modelId}, retrying once`);
+        continue;
+      }
+    }
 
     if ((status === 429 || status === 529) && rateRetries < 2) {
       const retryAfter = parseInt(up.headers['retry-after'], 10);
